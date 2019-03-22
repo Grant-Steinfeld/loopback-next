@@ -7,7 +7,11 @@ import * as debugModule from 'debug';
 import {BindingAddress, BindingKey} from './binding-key';
 import {Context} from './context';
 import {Provider} from './provider';
-import {ResolutionSession} from './resolution-session';
+import {
+  asResolutionOptions,
+  ResolutionOptionsOrSession,
+  ResolutionSession,
+} from './resolution-session';
 import {instantiateClass} from './resolver';
 import {
   BoundValue,
@@ -113,6 +117,10 @@ export enum BindingType {
    * A provider class with `value()` function to get the value
    */
   PROVIDER = 'Provider',
+  /**
+   * A alias to another binding key with optional path
+   */
+  ALIAS = 'Alias',
 }
 
 // tslint:disable-next-line:no-any
@@ -162,9 +170,9 @@ export class Binding<T = BoundValue> {
 
   private _cache: WeakMap<Context, T>;
   private _getValue: (
-    ctx?: Context,
-    session?: ResolutionSession,
-  ) => ValueOrPromise<T>;
+    ctx: Context,
+    optionsOrSession?: ResolutionOptionsOrSession,
+  ) => ValueOrPromise<T | undefined>;
 
   private _valueConstructor?: Constructor<T>;
   /**
@@ -228,7 +236,10 @@ export class Binding<T = BoundValue> {
    * @param ctx Context for the resolution
    * @param session Optional session for binding and dependency resolution
    */
-  getValue(ctx: Context, session?: ResolutionSession): ValueOrPromise<T> {
+  getValue(
+    ctx: Context,
+    optionsOrSession?: ResolutionOptionsOrSession,
+  ): ValueOrPromise<T> {
     /* istanbul ignore if */
     if (debug.enabled) {
       debug('Get value for binding %s', this.key);
@@ -246,11 +257,15 @@ export class Binding<T = BoundValue> {
         }
       }
     }
+    optionsOrSession = asResolutionOptions(optionsOrSession);
     if (this._getValue) {
       let result = ResolutionSession.runWithBinding(
-        s => this._getValue(ctx, s),
+        s => {
+          const options = Object.assign({}, optionsOrSession, {session: s});
+          return this._getValue(ctx, options);
+        },
         this,
-        session,
+        optionsOrSession.session,
       );
       return this._cacheValue(ctx, result);
     }
@@ -426,11 +441,11 @@ export class Binding<T = BoundValue> {
       debug('Bind %s to provider %s', this.key, providerClass.name);
     }
     this._type = BindingType.PROVIDER;
-    this._getValue = (ctx, session) => {
+    this._getValue = (ctx, optionsOrSession) => {
       const providerOrPromise = instantiateClass<Provider<T>>(
         providerClass,
-        ctx!,
-        session,
+        ctx,
+        asResolutionOptions(optionsOrSession).session,
       );
       return transformValueOrPromise(providerOrPromise, p => p.value());
     };
@@ -450,11 +465,44 @@ export class Binding<T = BoundValue> {
       debug('Bind %s to class %s', this.key, ctor.name);
     }
     this._type = BindingType.CLASS;
-    this._getValue = (ctx, session) => instantiateClass(ctor, ctx!, session);
+    this._getValue = (ctx, optionsOrSession) =>
+      instantiateClass(
+        ctor,
+        ctx,
+        asResolutionOptions(optionsOrSession).session,
+      );
     this._valueConstructor = ctor;
     return this;
   }
 
+  /**
+   * Bind the key to an alias of another binding
+   * @param keyWithPath Target binding key with optional path,
+   * such as `servers.RestServer.options#apiExplorer`
+   */
+  toAlias(keyWithPath: BindingAddress<T>) {
+    /* istanbul ignore if */
+    if (debug.enabled) {
+      debug('Bind %s to alias %s', this.key, keyWithPath);
+    }
+    this._type = BindingType.ALIAS;
+    this._getValue = (ctx, optionsOrSession) => {
+      const options = asResolutionOptions(optionsOrSession);
+      const valueOrPromise = ctx.getValueOrPromise(keyWithPath, options);
+      return transformValueOrPromise(valueOrPromise, val => {
+        if (val === undefined && !options.optional) {
+          throw new Error(
+            `No value was configured for binding ${keyWithPath}.`,
+          );
+        } else return val;
+      });
+    };
+    return this;
+  }
+
+  /**
+   * Unlock the binding
+   */
   unlock(): this {
     this.isLocked = false;
     return this;
